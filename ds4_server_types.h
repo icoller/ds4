@@ -96,11 +96,22 @@ typedef struct {
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+    bool chat_requires_live_tool_state;
+    stop_list chat_live_call_ids;
+    char *chat_live_suffix_text;
     char *previous_response_id;
     char *continuation_suffix_text;
     char *client_session_key;
     char *implicit_session_basis;
     char *implicit_session_key;
+    bool prompt_anatomy_valid;
+    int prompt_system_msgs;
+    int prompt_user_msgs;
+    int prompt_assistant_msgs;
+    int prompt_tool_msgs;
+    int prompt_tool_schema_tokens_approx;
+    int prompt_system_tokens_approx;
+    int prompt_recent_tail_tokens_approx;
     tool_replay_stats tool_replay;
 } request;
 
@@ -117,6 +128,7 @@ static void stop_list_clear(stop_list *stops);
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 static void id_list_free(stop_list *ids);
+static bool chat_live_has_call_id(server *s, const char *id);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
 
@@ -231,8 +243,10 @@ struct server {
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
+    live_tool_state chat_live;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
+    visible_live_state replay_live;
     visible_live_state thinking_live;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;

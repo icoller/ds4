@@ -24,6 +24,9 @@ DS4_SERVER_PARSE_LINKAGE void request_free(request *r) {
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    stop_list_clear(&r->chat_live_call_ids);
+    free(r->chat_live_call_ids.v);
+    free(r->chat_live_suffix_text);
     free(r->previous_response_id);
     free(r->continuation_suffix_text);
     free(r->client_session_key);
@@ -1685,6 +1688,75 @@ static char *responses_build_session_basis(const char *instructions,
     return buf_take(&out);
 }
 
+static int approx_token_count_for_text(ds4_engine *e, const char *text) {
+    if (!e || !text || !text[0]) return 0;
+    ds4_tokens toks = {0};
+    ds4_tokenize_rendered_chat(e, text, &toks);
+    int n = toks.len;
+    ds4_tokens_free(&toks);
+    return n;
+}
+
+static void request_capture_prompt_anatomy(ds4_engine *e, request *r,
+                                           const chat_msgs *msgs,
+                                           const char *tool_schemas) {
+    if (!e || !r || !msgs) return;
+    r->prompt_anatomy_valid = false;
+    r->prompt_system_msgs = 0;
+    r->prompt_user_msgs = 0;
+    r->prompt_assistant_msgs = 0;
+    r->prompt_tool_msgs = 0;
+    r->prompt_tool_schema_tokens_approx = 0;
+    r->prompt_system_tokens_approx = 0;
+    r->prompt_recent_tail_tokens_approx = 0;
+
+    buf system = {0};
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            r->prompt_system_msgs++;
+            if (system.len) buf_puts(&system, "\n\n");
+            buf_puts(&system, m->content ? m->content : "");
+        } else if (!strcmp(m->role, "assistant")) {
+            r->prompt_assistant_msgs++;
+        } else if (role_is_user_like(m->role)) {
+            if (!strcmp(m->role, "user")) r->prompt_user_msgs++;
+            else r->prompt_tool_msgs++;
+        }
+    }
+
+    if (tool_schemas && tool_schemas[0]) {
+        buf tools = {0};
+        append_tools_prompt_text(&tools, tool_schemas);
+        r->prompt_tool_schema_tokens_approx =
+            approx_token_count_for_text(e, tools.ptr ? tools.ptr : "");
+        buf_free(&tools);
+    }
+    r->prompt_system_tokens_approx =
+        approx_token_count_for_text(e, system.ptr ? system.ptr : "");
+    buf_free(&system);
+
+    int tail_start = msgs->len;
+    while (tail_start > 0 && role_is_system(msgs->v[tail_start - 1].role)) tail_start--;
+    while (tail_start > 0) {
+        const chat_msg *m = &msgs->v[tail_start - 1];
+        if (!role_is_user_like(m->role)) break;
+        tail_start--;
+    }
+    if (tail_start < msgs->len) {
+        char *tail = render_live_tool_tail(msgs, tail_start, r->think_mode);
+        r->prompt_recent_tail_tokens_approx =
+            approx_token_count_for_text(e, tail ? tail : "");
+        free(tail);
+    }
+    r->prompt_anatomy_valid = true;
+}
+
+static bool chat_msg_is_tool_result_tail(const chat_msg *m) {
+    return m && (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) &&
+           ((m->tool_call_id && m->tool_call_id[0]) || m->tool_call_ids_len > 0);
+}
+
 static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
     if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
     for (int i = 0; i < m->calls.len; i++) {
@@ -1852,6 +1924,37 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
     return true;
 }
 
+static bool chat_validate_tool_results(server *s, const chat_msgs *msgs,
+                                       bool *requires_live_tool_state,
+                                       char *err, size_t errlen) {
+    if (requires_live_tool_state) *requires_live_tool_state = false;
+    if (!msgs) return true;
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!chat_msg_is_tool_result_tail(m)) continue;
+
+        stop_list ids = {0};
+        chat_msg_collect_tool_call_ids(m, &ids);
+        for (int j = 0; j < ids.len; j++) {
+            const char *id = ids.v[j];
+            const bool live_known = chat_live_has_call_id(s, id);
+            const chat_msg *prior = responses_find_prior_call_msg(msgs, i, id);
+            if (!live_known && !prior) {
+                snprintf(err, errlen,
+                         "Chat continuation state is not available for tool_call_id %s; retry by replaying the full messages history",
+                         id);
+                id_list_free(&ids);
+                return false;
+            }
+            if (!prior && requires_live_tool_state) {
+                *requires_live_tool_state = true;
+            }
+        }
+        id_list_free(&ids);
+    }
+    return true;
+}
+
 /* Prepare the Anthropic live-tool fast path.
  *
  * Anthropic's visible replay normally includes the assistant tool_use JSON and
@@ -1881,6 +1984,31 @@ static void anthropic_prepare_live_continuation(request *r,
 
     free(r->anthropic_live_suffix_text);
     r->anthropic_live_suffix_text =
+        render_live_tool_tail(msgs, tail_start, r->think_mode);
+}
+
+static void chat_prepare_live_continuation(request *r,
+                                           const chat_msgs *msgs) {
+    if (!r || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int tail_end = msgs->len;
+    while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
+    int tail_start = tail_end;
+    while (tail_start > 0 &&
+           chat_msg_is_tool_result_tail(&msgs->v[tail_start - 1]))
+    {
+        tail_start--;
+    }
+    if (tail_start == tail_end) return;
+
+    stop_list_clear(&r->chat_live_call_ids);
+    for (int i = tail_start; i < msgs->len; i++) {
+        chat_msg_collect_tool_call_ids(&msgs->v[i], &r->chat_live_call_ids);
+    }
+    if (r->chat_live_call_ids.len == 0) return;
+
+    free(r->chat_live_suffix_text);
+    r->chat_live_suffix_text =
         render_live_tool_tail(msgs, tail_start, r->think_mode);
 }
 
@@ -2041,16 +2169,27 @@ DS4_SERVER_PARSE_LINKAGE bool parse_chat_request(ds4_engine *e, server *s,
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    if (!chat_validate_tool_results(s, &msgs, &r->chat_requires_live_tool_state,
+                                    err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     responses_trim_history_to_context(e, &msgs, active_tool_schemas,
                                       &r->tool_orders, r->think_mode, ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    chat_prepare_live_continuation(r, &msgs);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (s && s->trace) {
+        request_capture_prompt_anatomy(e, r, &msgs, active_tool_schemas);
+    }
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -2271,6 +2410,9 @@ DS4_SERVER_PARSE_LINKAGE bool parse_anthropic_request(ds4_engine *e, server *s,
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (s && s->trace) {
+        request_capture_prompt_anatomy(e, r, &msgs, active_tool_schemas);
+    }
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -3406,6 +3548,9 @@ DS4_SERVER_PARSE_LINKAGE bool parse_responses_request(ds4_engine *e, server *s,
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (s && s->trace) {
+        request_capture_prompt_anatomy(e, r, &msgs, active_tool_schemas);
+    }
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);

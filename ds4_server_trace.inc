@@ -305,13 +305,17 @@ typedef struct {
     server *srv;
     int fd;
     const request *req;
+    const ds4_tokens *cold_store_tokens;
     req_kind kind;
     int prompt_tokens;
     int cached_tokens;
+    int cold_store_len;
+    int cold_store_suppressed_old;
     char ctx[48];
     const char *phase;
     bool has_tools;
     bool responses_protocol;
+    bool cold_store_done;
     double t0;
     double last_t;
     double last_keepalive_t;
@@ -450,6 +454,23 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     server_prefill_progress *p = ud;
     if (!p || !event || strcmp(event, "prefill_chunk")) return;
 
+    if (p->srv && !p->cold_store_done &&
+        p->cold_store_len >= p->cached_tokens &&
+        current == p->cold_store_len)
+    {
+        if (kv_cache_store_live_prefix(p->srv, p->cold_store_tokens,
+                                       p->cold_store_len, "cold")) {
+            kv_cache_note_store(&p->srv->kv, p->cold_store_len);
+            p->cold_store_suppressed_old = -1;
+        } else {
+            kv_cache_restore_suppressed_continued(&p->srv->kv,
+                                                  p->cold_store_suppressed_old,
+                                                  p->cold_store_len);
+            p->cold_store_suppressed_old = -1;
+        }
+        p->cold_store_done = true;
+    }
+
     double now = now_sec();
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
@@ -503,4 +524,3 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
         kv_cache_maybe_store_continued(p->srv);
     }
 }
-

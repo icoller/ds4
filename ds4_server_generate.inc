@@ -1,3 +1,10 @@
+static int prompt_anatomy_take_suffix_tokens(int *remaining, int approx_part_tokens) {
+    if (!remaining || *remaining <= 0 || approx_part_tokens <= 0) return 0;
+    int take = *remaining < approx_part_tokens ? *remaining : approx_part_tokens;
+    *remaining -= take;
+    return take;
+}
+
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
@@ -9,12 +16,17 @@ static void generate_job(server *s, job *j) {
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
+    const bool openai_chat_protocol = j->req.api == API_OPENAI &&
+                                      j->req.kind == REQ_CHAT;
     bool responses_live_continuation = false;
     bool responses_stored_continuation = false;
+    bool chat_live_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
+    const char *chat_live_match = NULL;
     int responses_live_match_ids = 0;
+    int chat_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
     int cached = 0;
     const char *cache_source = "none";
@@ -74,7 +86,28 @@ static void generate_job(server *s, job *j) {
     if (responses_stored_continuation || cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else {
+    } else if (openai_chat_protocol) {
+        cached = chat_live_visible_prefix_prompt(s, &j->req, old_pos,
+                                                 &effective_prompt);
+        if (cached > 0) {
+            chat_live_continuation = true;
+            chat_live_match = "visible-prefix";
+            cache_source = "chat-visible";
+            prompt_for_sync = &effective_prompt;
+        }
+        if (cached == 0) {
+            cached = chat_live_continuation_prompt(s, &j->req, old_pos,
+                                                   &effective_prompt,
+                                                   &chat_live_match_ids);
+            if (cached > 0) {
+                chat_live_continuation = true;
+                chat_live_match = "tool-output-ids";
+                cache_source = "chat-tool-output";
+                prompt_for_sync = &effective_prompt;
+            }
+        }
+    }
+    if (!responses_live_continuation && !chat_live_continuation) {
         cached = anthropic_live_continuation_prompt(s, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -103,6 +136,13 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "previous_response_id state is not available; replay full input or retry with the latest response");
+        return;
+    } else if (cached == 0 && openai_chat_protocol &&
+               j->req.chat_requires_live_tool_state)
+    {
+        ds4_tokens_free(&effective_prompt);
+        http_error(j->fd, s->enable_cors, 409,
+                   "Chat continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
@@ -145,10 +185,13 @@ static void generate_job(server *s, job *j) {
                    trace_cache_miss_reason(&cache_diag));
     }
     if (cached == 0) s->kv.continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens &&
+        kv_cache_has_load_candidate(s, &j->req)) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
+         * would silently discard the newer conversation state.  Skip this write
+         * on plain misses: if there is no reusable disk candidate, the lookup
+         * cannot replace the live session anyway. */
         kv_cache_store_current(s, "evict");
     }
     if (cached == 0) {
@@ -188,6 +231,7 @@ static void generate_job(server *s, job *j) {
         .srv = s,
         .fd = j->fd,
         .req = &j->req,
+        .cold_store_tokens = prompt_for_sync,
         .kind = j->req.kind,
         .prompt_tokens = prompt_tokens,
         .cached_tokens = cached,
@@ -212,6 +256,13 @@ static void generate_job(server *s, job *j) {
                    responses_live_match_ids,
                    cached,
                    prompt_tokens);
+    } else if (chat_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: chat live continuation match=%s ids=%d cached=%d prompt=%d",
+                   chat_live_match ? chat_live_match : "unknown",
+                   chat_live_match_ids,
+                   cached,
+                   prompt_tokens);
     } else if (anthropic_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
@@ -223,6 +274,49 @@ static void generate_job(server *s, job *j) {
                    "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
                    cached,
                    prompt_tokens);
+    }
+    if (j->req.prompt_anatomy_valid && j->req.prompt.len > 0) {
+        int replay_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+        int approx_middle = j->req.prompt.len -
+            j->req.prompt_tool_schema_tokens_approx -
+            j->req.prompt_system_tokens_approx -
+            j->req.prompt_recent_tail_tokens_approx;
+        if (approx_middle < 0) approx_middle = 0;
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: prompt anatomy total=%d cached=%d replay=%d approx_tools=%d approx_system=%d approx_middle=%d approx_recent_tail=%d msgs(system=%d user=%d assistant=%d tool=%d)",
+                   j->req.prompt.len,
+                   cached,
+                   replay_tokens,
+                   j->req.prompt_tool_schema_tokens_approx,
+                   j->req.prompt_system_tokens_approx,
+                   approx_middle,
+                   j->req.prompt_recent_tail_tokens_approx,
+                   j->req.prompt_system_msgs,
+                   j->req.prompt_user_msgs,
+                   j->req.prompt_assistant_msgs,
+                   j->req.prompt_tool_msgs);
+        if (replay_tokens > 0) {
+            int replay_remaining = replay_tokens;
+            int replay_recent_tail =
+                prompt_anatomy_take_suffix_tokens(&replay_remaining,
+                                                  j->req.prompt_recent_tail_tokens_approx);
+            int replay_middle =
+                prompt_anatomy_take_suffix_tokens(&replay_remaining, approx_middle);
+            int replay_system =
+                prompt_anatomy_take_suffix_tokens(&replay_remaining,
+                                                  j->req.prompt_system_tokens_approx);
+            int replay_tools =
+                prompt_anatomy_take_suffix_tokens(&replay_remaining,
+                                                  j->req.prompt_tool_schema_tokens_approx);
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: replay anatomy replay=%d uncached_suffix~ recent_tail=%d middle=%d system=%d tools=%d source=%s",
+                       replay_tokens,
+                       replay_recent_tail,
+                       replay_middle,
+                       replay_system,
+                       replay_tools,
+                       cache_source);
+        }
     }
     if (responses_visible_replay_without_reasoning) {
         /* The request replays a prior tool-call turn but omits the hidden
@@ -273,38 +367,18 @@ static void generate_job(server *s, job *j) {
         suppressed_continued_last =
             kv_cache_suppress_continued_store(&s->kv, cold_store_len);
     }
-
-    if (s->kv.enabled &&
-        cold_store_len >= s->kv.opt.min_tokens &&
+    progress.cold_store_len = cold_store_len;
+    progress.cold_store_suppressed_old = suppressed_continued_last;
+    if (cold_store_len >= s->kv.opt.min_tokens &&
         cold_store_len < prompt_for_sync->len)
     {
-        ds4_tokens prefix = {0};
-        tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (ds4_session_sync(s->session, &prefix, err, sizeof(err)) != 0) {
-            ds4_tokens_free(&prefix);
-            ds4_tokens_free(&effective_prompt);
-            ds4_session_set_progress(s->session, NULL, NULL);
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
-            trace_event(s, trace_id, "prefill failed: %s", err);
-            http_error(j->fd, s->enable_cors, 500, err);
-            return;
-        }
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
-            suppressed_continued_last = -1;
-        } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
-                                                  cold_store_len);
-            suppressed_continued_last = -1;
-        }
-        ds4_tokens_free(&prefix);
+        ds4_session_set_prefill_boundary(s->session, cold_store_len);
     }
 
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
-        kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+        kv_cache_restore_suppressed_continued(&s->kv, progress.cold_store_suppressed_old,
                                               cold_store_len);
         trace_event(s, trace_id, "prefill failed: %s", err);
         http_error(j->fd, s->enable_cors, 500, err);
@@ -313,6 +387,7 @@ static void generate_job(server *s, job *j) {
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s);
+    if (!chat_live_continuation) chat_live_clear(s);
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
@@ -324,14 +399,17 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
-    if (cold_store_len == prompt_for_sync->len) {
+    if (!progress.cold_store_done &&
+        cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
-            suppressed_continued_last = -1;
+            progress.cold_store_suppressed_old = -1;
         } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+            kv_cache_restore_suppressed_continued(&s->kv, progress.cold_store_suppressed_old,
                                                   cold_store_len);
+            progress.cold_store_suppressed_old = -1;
         }
+        progress.cold_store_done = true;
     }
     char id[96];
     snprintf(id, sizeof(id), "%s-%llu",
@@ -715,6 +793,8 @@ static void generate_job(server *s, job *j) {
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     char *responses_visible = NULL;
+    char *chat_visible = NULL;
+    char *replay_visible = NULL;
     if (j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error")) {
             /* Store the post-turn visible transcript plus the live token
@@ -741,6 +821,29 @@ static void generate_job(server *s, job *j) {
         } else {
             anthropic_live_clear(s);
         }
+    }
+    if (openai_chat_protocol) {
+        if (parsed_calls.len && strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length"))
+        {
+            chat_visible =
+                responses_build_visible_transcript(&j->req,
+                    parsed_content ? parsed_content : "",
+                    parsed_reasoning, &parsed_calls);
+            chat_live_remember(s, chat_visible ? chat_visible : "", &parsed_calls);
+        } else {
+            chat_live_clear(s);
+        }
+    }
+    if (j->req.kind == REQ_CHAT && strcmp(final_finish, "error")) {
+        replay_visible =
+            responses_build_visible_transcript(&j->req,
+                parsed_content ? parsed_content : "",
+                parsed_reasoning, &parsed_calls);
+        if (replay_visible && replay_visible[0]) replay_live_remember(s, replay_visible);
+        else replay_live_clear(s);
+    } else {
+        replay_live_clear(s);
     }
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
@@ -894,6 +997,8 @@ static void generate_job(server *s, job *j) {
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
     free(responses_visible);
+    free(chat_visible);
+    free(replay_visible);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
 }

@@ -45,12 +45,16 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   declarations for requests, chat/tool payloads, KV metadata, tool memory, and
   `server`/`job`; extracted first in the second-stage modularization to shrink
   `ds4_server.c` without changing linkage.
-- `ds4_server_data.inc`: container ownership, clone/free helpers, and tool
-  schema order utilities for chat/tool payloads; extracted so `ds4_server.c`
-  keeps only top-level wiring before the larger protocol blocks.
+- `ds4_server_data.inc`: implementation body for container ownership,
+  clone/free helpers, and tool schema order utilities for chat/tool payloads;
+  now compiled through `ds4_server_data.c` as the first real server-side module
+  split out of `ds4_server.c`.
 - `ds4_server_data_api.h`: shared linkage macro and stable declarations for
-  chat/tool container ownership helpers and schema-order utilities; added so the
-  data layer can later move out of include form without reworking every caller.
+  chat/tool container ownership helpers and schema-order utilities; used by both
+  `ds4_server.c` and `ds4_server_data.c` to keep the first module split link-safe.
+- `ds4_server_data.c`: dedicated translation unit that compiles the data-layer
+  helpers from `ds4_server_data.inc`; introduced as the first step from include
+  extraction toward true `.c/.h` modularization.
 - `ds4_server_parse_api.h`: shared linkage macro and stable declarations for
   the parse-layer entry points currently used by HTTP handling and tests; added
   as a preparation step before turning parse include blocks into real modules.
@@ -101,9 +105,26 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
 - Implicit continuation is a compatibility fallback for agents that do not send
   `previous_response_id`: DS4 derives an alias key from session hints plus the
   stable system/tool basis and maps it to the latest stored response.
+- `/v1/chat/completions` now reuses the same live-continuation idea for local
+  agent loops: when the next request either replays the visible transcript or
+  sends only tool-result tails for the currently live call ids, DS4 continues
+  from the live KV frontier instead of re-prefilling the full rendered chat.
+- `generate` also remembers one generic visible replay frontier for chat turns,
+  so ordinary chat follow-up requests can reuse the live KV by visible prefix
+  before falling back to expensive full live-text rendering.
 - The current minimal implementation is append-only: when `previous_response_id`
   is present, do not resend new `instructions`, `tools`, or additional
   system/developer messages in the same request.
+- Prompt-anatomy token sampling is now a trace-only diagnostic: keep it behind
+  `--trace` so normal requests do not pay extra tokenization cost just to emit
+  prefill breakdown logs.
+- Before a disk-text restore is allowed to replace the current live session,
+  `generate` now first checks whether a reusable disk candidate actually exists;
+  avoid unconditional `kv_cache_store_current("evict")` on plain misses.
+- Cold KV checkpoints no longer require a separate prefix-only `ds4_session_sync`
+  pass: `ds4_session_sync()` accepts a one-shot prefill boundary so chunked
+  prefill can split exactly at the requested token frontier and let the server
+  store the cold checkpoint during the main sync.
 - `ds4_server_runtime.inc`: server config parsing, usage/help text, backend
   defaults, resource teardown, and other runtime helpers used by the
   production `main`.

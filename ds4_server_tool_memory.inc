@@ -232,6 +232,24 @@ static void thinking_live_clear(server *s) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+static void replay_live_clear(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->tool_mu);
+    visible_live_clear_locked(&s->replay_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void replay_live_remember(server *s, const char *visible_text) {
+    if (!s || !visible_text || !visible_text[0]) return;
+    pthread_mutex_lock(&s->tool_mu);
+    visible_live_clear_locked(&s->replay_live);
+    s->replay_live.visible_text = xstrdup(visible_text);
+    s->replay_live.visible_len = strlen(visible_text);
+    s->replay_live.live_tokens = ds4_session_pos(s->session);
+    s->replay_live.valid = true;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void thinking_live_remember(server *s, const char *visible_text) {
     if (!s || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -240,6 +258,23 @@ static void thinking_live_remember(server *s, const char *visible_text) {
     s->thinking_live.visible_len = strlen(visible_text);
     s->thinking_live.live_tokens = ds4_session_pos(s->session);
     s->thinking_live.valid = true;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void chat_live_remember(server *s, const char *visible_text,
+                               const tool_calls *calls) {
+    if (!s || !calls || calls->len == 0) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&s->chat_live);
+    if (visible_text && visible_text[0]) {
+        s->chat_live.visible_text = xstrdup(visible_text);
+        s->chat_live.visible_len = strlen(visible_text);
+    }
+    for (int i = 0; i < calls->len; i++) {
+        id_list_push_unique(&s->chat_live.call_ids, calls->v[i].id);
+    }
+    s->chat_live.live_tokens = ds4_session_pos(s->session);
+    s->chat_live.valid = s->chat_live.call_ids.len > 0;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -279,11 +314,27 @@ static void responses_live_clear(server *s) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+static void chat_live_clear(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&s->chat_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void anthropic_live_clear(server *s) {
     if (!s) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&s->anthropic_live);
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+static bool chat_live_has_call_id(server *s, const char *id) {
+    if (!s || !id || !id[0]) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool found = s->chat_live.valid &&
+                 id_list_contains(&s->chat_live.call_ids, id);
+    pthread_mutex_unlock(&s->tool_mu);
+    return found;
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -302,6 +353,20 @@ static bool anthropic_live_has_call_id(server *s, const char *id) {
                  id_list_contains(&s->anthropic_live.call_ids, id);
     pthread_mutex_unlock(&s->tool_mu);
     return found;
+}
+
+static bool chat_live_matches_request(server *s, const stop_list *ids,
+                                      int live_tokens) {
+    if (!s || !ids || ids->len == 0) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = s->chat_live.valid &&
+              s->chat_live.live_tokens == live_tokens &&
+              s->chat_live.call_ids.len == ids->len;
+    for (int i = 0; ok && i < ids->len; i++) {
+        ok = id_list_contains(&s->chat_live.call_ids, ids->v[i]);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
 }
 
 static bool responses_live_matches_request(server *s, const stop_list *ids,
@@ -477,4 +542,3 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
         if (st->tool.ids[i] && st->tool.ids[i][0]) calls->v[i].id = xstrdup(st->tool.ids[i]);
     }
 }
-

@@ -1311,6 +1311,16 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
     return best;
 }
 
+static bool kv_cache_has_load_candidate(server *s, const request *req) {
+    if (!s || !req || !req->prompt_text) return false;
+    kv_disk_cache *kc = &s->kv;
+    if (!kc->enabled) return false;
+    const int quant_bits = ds4_engine_routed_quant_bits(s->engine);
+    if (quant_bits != 2 && quant_bits != 4) return false;
+    return kv_cache_find_text_prefix(kc, req->prompt_text, quant_bits,
+                                     ds4_session_ctx(s->session)) >= 0;
+}
+
 static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
@@ -1440,11 +1450,43 @@ static int kv_cache_try_load(server *s, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
+static int replay_live_visible_prefix_prompt(server *s, const request *req,
+                                             int live_pos,
+                                             ds4_tokens *effective_prompt) {
+    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
+
+    const size_t prompt_len = strlen(req->prompt_text);
+    size_t visible_len = 0;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = s->replay_live.valid &&
+              s->replay_live.live_tokens == live_pos &&
+              s->replay_live.visible_text &&
+              s->replay_live.visible_len < prompt_len &&
+              byte_prefix_match(req->prompt_text, prompt_len,
+                                s->replay_live.visible_text,
+                                s->replay_live.visible_len);
+    if (ok) visible_len = s->replay_live.visible_len;
+    pthread_mutex_unlock(&s->tool_mu);
+    if (!ok) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->prompt_text + visible_len,
+        effective_prompt);
+    return live_tokens->len;
+}
+
 static int live_text_prefix_prompt(server *s, const request *req,
                                    ds4_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len <= 0) return 0;
+
+    int visible_cached = replay_live_visible_prefix_prompt(
+        s, req, live_tokens->len, effective_prompt);
+    if (visible_cached > 0) return visible_cached;
 
     size_t live_text_len = 0;
     char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
@@ -1519,6 +1561,25 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
     return live_tokens->len;
 }
 
+static int chat_live_continuation_prompt(server *s, const request *req,
+                                         int live_pos,
+                                         ds4_tokens *effective_prompt,
+                                         int *matched_ids) {
+    if (!s || !req || !effective_prompt) return 0;
+    if (req->api != API_OPENAI || !req->chat_live_suffix_text) return 0;
+    if (req->chat_live_call_ids.len == 0) return 0;
+    if (!chat_live_matches_request(s, &req->chat_live_call_ids, live_pos)) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->chat_live_suffix_text,
+        effective_prompt);
+    if (matched_ids) *matched_ids = req->chat_live_call_ids.len;
+    return live_tokens->len;
+}
+
 /* Visible-replay Responses continuation.
  *
  * Other clients send the full visible transcript on every turn even though the
@@ -1549,6 +1610,35 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
                                 s->responses_live.visible_text,
                                 s->responses_live.visible_len);
     if (ok) visible_len = s->responses_live.visible_len;
+    pthread_mutex_unlock(&s->tool_mu);
+    if (!ok) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->prompt_text + visible_len,
+        effective_prompt);
+    return live_tokens->len;
+}
+
+static int chat_live_visible_prefix_prompt(server *s, const request *req,
+                                           int live_pos,
+                                           ds4_tokens *effective_prompt) {
+    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
+    if (req->api != API_OPENAI) return 0;
+
+    const size_t prompt_len = strlen(req->prompt_text);
+    size_t visible_len = 0;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = s->chat_live.valid &&
+              s->chat_live.live_tokens == live_pos &&
+              s->chat_live.visible_text &&
+              s->chat_live.visible_len < prompt_len &&
+              byte_prefix_match(req->prompt_text, prompt_len,
+                                s->chat_live.visible_text,
+                                s->chat_live.visible_len);
+    if (ok) visible_len = s->chat_live.visible_len;
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
@@ -1602,4 +1692,3 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
         effective_prompt);
     return live_tokens->len;
 }
-

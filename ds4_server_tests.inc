@@ -2044,6 +2044,43 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     request_free(&r);
 }
 
+static void test_chat_live_tail_renders_tool_outputs_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_chat_live");
+    tc.name = xstrdup("read");
+    tc.arguments = xstrdup("{\"path\":\"main.go\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_chat_live");
+    tool.content = xstrdup("package main");
+    chat_msgs_push(&msgs, tool);
+
+    chat_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.chat_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.chat_live_call_ids.v[0], "call_chat_live"));
+    TEST_ASSERT(r.chat_live_suffix_text != NULL);
+    TEST_ASSERT(!strncmp(r.chat_live_suffix_text,
+                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
+                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+    TEST_ASSERT(strstr(r.chat_live_suffix_text, "package main</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.chat_live_suffix_text, "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.chat_live_suffix_text, "read") == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
 static void test_responses_tool_output_id_validation(void) {
     server s = {0};
     pthread_mutex_init(&s.tool_mu, NULL);
@@ -2074,6 +2111,40 @@ static void test_responses_tool_output_id_validation(void) {
 
     chat_msgs_free(&msgs);
     live_tool_state_free(&s.responses_live);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
+static void test_chat_tool_output_id_validation(void) {
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    chat_msgs msgs = {0};
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_chat_missing");
+    tool.content = xstrdup("out");
+    chat_msgs_push(&msgs, tool);
+
+    char err[160] = {0};
+    TEST_ASSERT(!chat_validate_tool_results(&s, &msgs, NULL,
+                                            err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "Chat continuation state is not available") != NULL);
+
+    pthread_mutex_lock(&s.tool_mu);
+    s.chat_live.valid = true;
+    s.chat_live.live_tokens = 10;
+    id_list_push_unique(&s.chat_live.call_ids, "call_chat_missing");
+    pthread_mutex_unlock(&s.tool_mu);
+
+    err[0] = '\0';
+    bool needs_live_tool_state = false;
+    TEST_ASSERT(chat_validate_tool_results(&s, &msgs,
+                                           &needs_live_tool_state,
+                                           err, sizeof(err)));
+    TEST_ASSERT(needs_live_tool_state);
+
+    chat_msgs_free(&msgs);
+    live_tool_state_free(&s.chat_live);
     pthread_mutex_destroy(&s.tool_mu);
 }
 
@@ -3527,6 +3598,8 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_live_tail_renders_tool_outputs_only();
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
+    test_chat_live_tail_renders_tool_outputs_only();
+    test_chat_tool_output_id_validation();
     test_responses_visible_suffix_matches_client_replay();
     test_responses_implicit_session_key_uses_session_and_basis();
     test_previous_response_tail_renders_new_user_append();

@@ -13533,6 +13533,7 @@ static bool metal_graph_prefill_chunked_range(
         const token_vec       *prompt,
         uint32_t               start,
         uint32_t               n_tokens,
+        uint32_t               split_boundary,
         float                 *logits,
         bool                   show_progress,
         ds4_session_progress_fn progress,
@@ -13546,6 +13547,7 @@ static bool metal_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
+    const uint32_t end = start + n_tokens;
     uint32_t first_chunk = n_tokens < chunk_cap ? n_tokens : chunk_cap;
     if (start != 0 && g->prefill_cap != 0) {
         const uint32_t mod = start % g->prefill_cap;
@@ -13554,6 +13556,10 @@ static bool metal_graph_prefill_chunked_range(
             if (to_boundary < first_chunk) first_chunk = to_boundary;
         }
     }
+    if (split_boundary > start && split_boundary < end) {
+        const uint32_t to_split = split_boundary - start;
+        if (to_split < first_chunk) first_chunk = to_split;
+    }
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, first_chunk)) return false;
 
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
@@ -13561,7 +13567,6 @@ static bool metal_graph_prefill_chunked_range(
     double encode_s = 0.0;
     double execute_s = 0.0;
     uint32_t last_chunk_tokens = 0;
-    const uint32_t end = start + n_tokens;
 
     if (progress) {
         progress(progress_ud, "prefill_chunk", (int)start, prompt->len);
@@ -13576,6 +13581,10 @@ static bool metal_graph_prefill_chunked_range(
                 const uint32_t to_boundary = g->prefill_cap - mod;
                 if (to_boundary < local_cap) local_cap = to_boundary;
             }
+        }
+        if (split_boundary > pos0 && split_boundary < end) {
+            const uint32_t to_split = split_boundary - pos0;
+            if (to_split < local_cap) local_cap = to_split;
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         last_chunk_tokens = chunk;
@@ -13691,6 +13700,7 @@ static bool metal_graph_prefill_chunked(
         const ds4_weights     *weights,
         const token_vec       *prompt,
         int                    n_tokens,
+        uint32_t               split_boundary,
         float                 *logits,
         bool                   show_progress,
         ds4_session_progress_fn progress,
@@ -13702,6 +13712,7 @@ static bool metal_graph_prefill_chunked(
                                              prompt,
                                              0,
                                              (uint32_t)n_tokens,
+                                             split_boundary,
                                              logits,
                                              show_progress,
                                              progress,
@@ -15502,7 +15513,8 @@ static int generate_metal_graph_raw_swa(
 
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
-        ok = metal_graph_prefill_chunked(&g, model, weights, prompt, prompt->len, logits, false, progress, progress_ud);
+        ok = metal_graph_prefill_chunked(&g, model, weights, prompt, prompt->len,
+                                         0, logits, false, progress, progress_ud);
     } else {
         ok = metal_graph_prefill_raw_swa(&g, model, weights, prompt, prompt->len, logits, true);
     }
@@ -15728,6 +15740,7 @@ struct ds4_session {
     ds4_session_progress_fn progress;
     void *progress_ud;
     uint32_t prefill_cap;
+    uint32_t prefill_boundary;
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
@@ -16877,6 +16890,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                     ok = metal_graph_prefill_chunked_range(&g, model, weights,
                                                            &prompt, 0,
                                                            (uint32_t)prompt.len,
+                                                           0,
                                                            NULL, false,
                                                            NULL, NULL,
                                                            &collector);
@@ -17465,6 +17479,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 #else
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
+    const uint32_t prefill_boundary =
+        s->prefill_boundary > 0 && s->prefill_boundary < (uint32_t)prompt->len ?
+        s->prefill_boundary : 0;
+    s->prefill_boundary = 0;
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -17473,7 +17491,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        if (suffix > 0 && ((uint32_t)suffix >= resume_min ||
+                           (prefill_boundary > (uint32_t)s->checkpoint.len &&
+                            prefill_boundary < (uint32_t)prompt->len))) {
             ds4_sync_progress progress = {
                 .session = s,
                 .prompt = prompt,
@@ -17488,6 +17508,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         prompt,
                                                         (uint32_t)s->checkpoint.len,
                                                         (uint32_t)suffix,
+                                                        prefill_boundary,
                                                         s->logits,
                                                         false,
                                                         progress_fn,
@@ -17519,7 +17540,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 
     bool ok;
-    if (s->prefill_cap < (uint32_t)prompt->len) {
+    if (s->prefill_cap < (uint32_t)prompt->len || prefill_boundary > 0) {
         ds4_sync_progress progress = {
             .session = s,
             .prompt = prompt,
@@ -17529,7 +17550,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ds4_session_progress_fn progress_fn =
             s->progress ? ds4_session_note_prefill_progress : NULL;
         ok = metal_graph_prefill_chunked(&s->graph, &e->model, &e->weights,
-                                         prompt, prompt->len, s->logits, false,
+                                         prompt, prompt->len, prefill_boundary,
+                                         s->logits, false,
                                          progress_fn, progress_fn ? &progress : NULL);
     } else {
         ok = metal_graph_prefill_raw_swa(&s->graph, &e->model, &e->weights,
@@ -18400,4 +18422,13 @@ int ds4_session_pos(ds4_session *s) {
 
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
+}
+
+void ds4_session_set_prefill_boundary(ds4_session *s, int boundary) {
+    if (!s || boundary <= 0) {
+        if (s) s->prefill_boundary = 0;
+        return;
+    }
+    if (boundary >= s->ctx_size) boundary = s->ctx_size - 1;
+    s->prefill_boundary = (uint32_t)boundary;
 }

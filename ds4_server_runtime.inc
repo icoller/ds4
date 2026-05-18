@@ -72,8 +72,10 @@ static void server_close_resources(server *s) {
     }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
+    live_tool_state_free(&s->chat_live);
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
+    visible_live_free(&s->replay_live);
     visible_live_free(&s->thinking_live);
     continuation_clear_all(s);
     if (s->continuations_by_id) raxFree(s->continuations_by_id);
