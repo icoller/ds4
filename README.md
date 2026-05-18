@@ -1,5 +1,39 @@
 # DwarfStar 4
 
+English | [中文](README.zh-CN.md)
+
+## Agent Serving Optimizations
+
+This build focuses on one thing official inference stacks still struggle with in
+practice: **keeping coding-agent sessions fast after the first long turn**.
+Instead of paying the full prompt cost again and again, the server is tuned to
+reuse more of the already-built frontier and to waste less time on repeated
+prefill work.
+
+- **Server-managed continuation for long agent runs.** `/v1/responses` can
+  continue from `previous_response_id`, and both `/v1/responses` and
+  `/v1/chat/completions` can recover the live frontier through visible-prefix
+  replay and tool-result continuation paths.
+- **Far less repeated prefill in tool loops.** Chat tool rounds now reuse live
+  visible prefixes, tool-output tails, and generic replay frontiers before
+  falling back to a full prompt rebuild.
+- **Faster cold-start checkpointing.** Cold KV checkpoints are inserted during
+  the main prefill pass instead of requiring a separate prefix-only sync, which
+  cuts duplicated prefix work on long prompts.
+- **Less wasted CPU on diagnostics.** Prompt-anatomy accounting is now trace-only
+  instead of charging every request extra tokenization overhead.
+- **Less wasted disk I/O on misses.** The server now checks whether a reusable
+  disk candidate actually exists before evicting and storing the current live
+  checkpoint.
+- **Better observability for real bottlenecks.** Trace logs explain why a turn
+  reused only part of the prompt and where the uncached replay tokens came from,
+  making long-prefill tuning much easier.
+
+In short: this fork is shaped for **real agent workloads**, where the first turn
+is expensive, but the next ten turns should not keep paying the same bill.
+
+Reference: `https://github.com/antirez/ds4`
+
 DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
