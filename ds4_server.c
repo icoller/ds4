@@ -561,6 +561,11 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
                                            tool_replay_stats *stats);
 static bool tool_memory_has_id(server *s, const char *id);
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs);
+static bool responses_trim_history_to_context(ds4_engine *e, chat_msgs *msgs,
+                                              const char *tool_schemas,
+                                              const tool_schema_orders *orders,
+                                              ds4_think_mode think_mode,
+                                              int ctx_size);
 
 typedef struct {
     char **v;
@@ -684,6 +689,38 @@ static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
         msgs->v = xrealloc(msgs->v, (size_t)msgs->cap * sizeof(msgs->v[0]));
     }
     msgs->v[msgs->len++] = msg;
+}
+
+static tool_call tool_call_clone(const tool_call *src) {
+    tool_call dst = {0};
+    if (!src) return dst;
+    dst.id = src->id ? xstrdup(src->id) : NULL;
+    dst.name = src->name ? xstrdup(src->name) : NULL;
+    dst.arguments = src->arguments ? xstrdup(src->arguments) : NULL;
+    return dst;
+}
+
+static void tool_calls_copy(tool_calls *dst, const tool_calls *src) {
+    memset(dst, 0, sizeof(*dst));
+    if (!src) return;
+    dst->raw_dsml = src->raw_dsml ? xstrdup(src->raw_dsml) : NULL;
+    for (int i = 0; i < src->len; i++) {
+        tool_calls_push(dst, tool_call_clone(&src->v[i]));
+    }
+}
+
+static chat_msg chat_msg_clone(const chat_msg *src) {
+    chat_msg dst = {0};
+    if (!src) return dst;
+    dst.role = src->role ? xstrdup(src->role) : NULL;
+    dst.content = src->content ? xstrdup(src->content) : NULL;
+    dst.reasoning = src->reasoning ? xstrdup(src->reasoning) : NULL;
+    dst.tool_call_id = src->tool_call_id ? xstrdup(src->tool_call_id) : NULL;
+    for (int i = 0; i < src->tool_call_ids_len; i++) {
+        chat_msg_add_tool_call_id(&dst, src->tool_call_ids[i]);
+    }
+    tool_calls_copy(&dst.calls, &src->calls);
+    return dst;
 }
 
 static void tool_schema_order_free(tool_schema_order *o) {
@@ -2735,9 +2772,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    responses_trim_history_to_context(e, &msgs, active_tool_schemas,
+                                      &r->tool_orders, r->think_mode, ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
@@ -2943,10 +2982,19 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    bool auto_trimmed = responses_trim_history_to_context(
+        e, &msgs, active_tool_schemas, &r->tool_orders, r->think_mode, ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    anthropic_prepare_live_continuation(r, &msgs);
-    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    if (!auto_trimmed) {
+        anthropic_prepare_live_continuation(r, &msgs);
+    } else {
+        stop_list_clear(&r->anthropic_live_call_ids);
+        free(r->anthropic_live_suffix_text);
+        r->anthropic_live_suffix_text = NULL;
+        r->anthropic_requires_live_tool_state = false;
+    }
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
@@ -3080,6 +3128,153 @@ static bool parse_responses_content_array(const char **p, char **out) {
     return true;
 fail:
     buf_free(&b);
+    return false;
+}
+
+static const char *responses_compaction_text(const char *content,
+                                             const char *summary,
+                                             const char *output,
+                                             const char *result,
+                                             const char *input_str) {
+    if (summary && summary[0]) return summary;
+    if (content && content[0]) return content;
+    if (output && output[0]) return output;
+    if (result && result[0]) return result;
+    if (input_str && input_str[0]) return input_str;
+    return NULL;
+}
+
+static void responses_build_trimmed_msgs(const chat_msgs *src, int start_index,
+                                         chat_msgs *out) {
+    int first_non_system = src ? src->len : 0;
+    if (!src || !out) return;
+    for (int i = 0; i < src->len; i++) {
+        if (!role_is_system(src->v[i].role)) {
+            first_non_system = i;
+            break;
+        }
+    }
+    for (int i = 0; i < src->len; i++) {
+        if (!role_is_system(src->v[i].role)) continue;
+        chat_msgs_push(out, chat_msg_clone(&src->v[i]));
+    }
+    if (start_index > first_non_system && start_index < src->len) {
+        chat_msg note = {0};
+        note.role = xstrdup("system");
+        note.content = xstrdup(
+            "Earlier conversation turns were omitted because the replay exceeded "
+            "the server context window. Continue from the remaining recent turns "
+            "and any explicit conversation summaries.");
+        chat_msgs_push(out, note);
+    }
+    for (int i = start_index; i < src->len; i++) {
+        if (role_is_system(src->v[i].role)) continue;
+        chat_msgs_push(out, chat_msg_clone(&src->v[i]));
+    }
+}
+
+static size_t utf8_leading_trim_index(const char *s, size_t n, size_t want) {
+    if (!s || want >= n) return n;
+    while (want < n && (((unsigned char)s[want]) & 0xc0u) == 0x80u) want++;
+    return want;
+}
+
+static bool responses_trim_candidate_content(chat_msgs *msgs) {
+    static const char *prefix = "[Earlier content omitted]\n";
+    const size_t prefix_len = strlen(prefix);
+    if (!msgs) return false;
+    for (int i = 0; i < msgs->len; i++) {
+        chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role) || !m->content || !m->content[0]) continue;
+        size_t len = strlen(m->content);
+        if (len <= prefix_len + 128) continue;
+        size_t drop = len / 2;
+        if (len - drop < 128) drop = len - 128;
+        size_t keep_from = utf8_leading_trim_index(m->content, len, drop);
+        buf b = {0};
+        buf_puts(&b, prefix);
+        buf_puts(&b, m->content + keep_from);
+        free(m->content);
+        m->content = buf_take(&b);
+        return true;
+    }
+    return false;
+}
+
+static bool responses_trim_history_to_context(ds4_engine *e, chat_msgs *msgs,
+                                              const char *tool_schemas,
+                                              const tool_schema_orders *orders,
+                                              ds4_think_mode think_mode,
+                                              int ctx_size) {
+    if (!e || !msgs || msgs->len <= 0 || ctx_size <= 1) return false;
+    int first_non_system = -1;
+    for (int i = 0; i < msgs->len; i++) {
+        if (!role_is_system(msgs->v[i].role)) {
+            first_non_system = i;
+            break;
+        }
+    }
+    if (first_non_system < 0) return false;
+
+    for (int phase = 0; phase < 2; phase++) {
+        for (int start = first_non_system + 1; start < msgs->len; start++) {
+            const chat_msg *m = &msgs->v[start];
+            if (role_is_system(m->role)) continue;
+            if (phase == 0 && strcmp(m->role, "user") != 0) continue;
+            if (phase == 1 && strcmp(m->role, "assistant") != 0) continue;
+
+            chat_msgs candidate = {0};
+            char *prompt_text = NULL;
+            ds4_tokens prompt = {0};
+            responses_build_trimmed_msgs(msgs, start, &candidate);
+            if (candidate.len == 0) {
+                chat_msgs_free(&candidate);
+                continue;
+            }
+            prompt_text = render_chat_prompt_text(&candidate, tool_schemas, orders,
+                                                  think_mode);
+            ds4_tokenize_rendered_chat(e, prompt_text, &prompt);
+            if (prompt.len > 0 && prompt.len < ctx_size) {
+                chat_msgs_free(msgs);
+                *msgs = candidate;
+                free(prompt_text);
+                ds4_tokens_free(&prompt);
+                return true;
+            }
+            free(prompt_text);
+            ds4_tokens_free(&prompt);
+            chat_msgs_free(&candidate);
+        }
+    }
+    int fallback_start = -1;
+    for (int i = msgs->len - 1; i >= first_non_system; i--) {
+        if (role_is_system(msgs->v[i].role)) continue;
+        if (role_is_user_like(msgs->v[i].role)) {
+            fallback_start = i;
+            break;
+        }
+    }
+    if (fallback_start < 0) fallback_start = first_non_system;
+
+    chat_msgs candidate = {0};
+    responses_build_trimmed_msgs(msgs, fallback_start, &candidate);
+    for (int i = 0; i < 32 && candidate.len > 0; i++) {
+        char *prompt_text = render_chat_prompt_text(&candidate, tool_schemas, orders,
+                                                    think_mode);
+        ds4_tokens prompt = {0};
+        ds4_tokenize_rendered_chat(e, prompt_text, &prompt);
+        if (prompt.len > 0 && prompt.len < ctx_size) {
+            chat_msgs_free(msgs);
+            *msgs = candidate;
+            free(prompt_text);
+            ds4_tokens_free(&prompt);
+            return true;
+        }
+        free(prompt_text);
+        ds4_tokens_free(&prompt);
+        if (!responses_trim_candidate_content(&candidate)) break;
+    }
+    chat_msgs_free(&candidate);
     return false;
 }
 
@@ -3350,6 +3545,9 @@ item_fail:
             !strcmp(t, "tool_search_call") || !strcmp(t, "image_generation_call");
         bool is_bookkeeping =
             !strcmp(t, "compaction") || !strcmp(t, "context_compaction");
+        const char *compaction_text =
+            is_bookkeeping ? responses_compaction_text(content, summary, output,
+                                                       result, input_str) : NULL;
         if (!consumes_reasoning && !is_bookkeeping && pending_reasoning.len) {
             chat_msg flush_msg = {0};
             flush_msg.role = xstrdup("assistant");
@@ -3507,6 +3705,14 @@ item_fail:
             if (call_id || item_id) {
                 chat_msg_add_tool_call_id(&msg, call_id ? call_id : item_id);
             }
+            chat_msgs_push(msgs, msg);
+        } else if (is_bookkeeping && compaction_text) {
+            chat_msg msg = {0};
+            buf compacted = {0};
+            msg.role = xstrdup("system");
+            buf_puts(&compacted, "Conversation summary from context compaction:\n");
+            buf_puts(&compacted, compaction_text);
+            msg.content = buf_take(&compacted);
             chat_msgs_push(msgs, msg);
         } else if (!is_bookkeeping) {
             /* Anything we don't have an explicit branch for would silently
@@ -3871,6 +4077,8 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = ds4_think_mode_for_context(
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
+    bool auto_trimmed = responses_trim_history_to_context(
+        e, &msgs, active_tool_schemas, &r->tool_orders, r->think_mode, ctx_size);
     if (!responses_validate_tool_outputs(s, &msgs, r->think_mode,
                                          &r->responses_requires_live_tool_state,
                                          &r->responses_requires_live_reasoning,
@@ -3887,7 +4095,15 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    responses_prepare_live_continuation(r, &msgs);
+    if (!auto_trimmed) {
+        responses_prepare_live_continuation(r, &msgs);
+    } else {
+        stop_list_clear(&r->responses_live_call_ids);
+        free(r->responses_live_suffix_text);
+        r->responses_live_suffix_text = NULL;
+        r->responses_requires_live_tool_state = false;
+        r->responses_requires_live_reasoning = false;
+    }
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
@@ -4661,6 +4877,11 @@ static bool http_error(int fd, int code, const char *msg) {
     return ok;
 }
 
+static int http_status_for_prefill_error(const char *msg) {
+    if (msg && strstr(msg, "prompt exceeds context")) return 400;
+    return 500;
+}
+
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
@@ -4671,6 +4892,19 @@ static bool sse_headers(int fd) {
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n\r\n";
     return send_all(fd, h, strlen(h));
+}
+
+static bool sse_comment(int fd, const char *text) {
+    buf b = {0};
+    buf_puts(&b, ":");
+    if (text && text[0]) {
+        buf_putc(&b, ' ');
+        buf_puts(&b, text);
+    }
+    buf_puts(&b, "\n\n");
+    bool ok = send_all(fd, b.ptr, b.len);
+    buf_free(&b);
+    return ok;
 }
 
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
@@ -7491,6 +7725,7 @@ struct job {
     int fd;
     request req;
     bool done;
+    bool stream_headers_sent;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
@@ -9669,6 +9904,8 @@ static void trace_finish(
 
 typedef struct {
     server *srv;
+    int fd;
+    const request *req;
     req_kind kind;
     int prompt_tokens;
     int cached_tokens;
@@ -9678,6 +9915,7 @@ typedef struct {
     bool responses_protocol;
     double t0;
     double last_t;
+    double last_keepalive_t;
     int last_current;
     bool seen;
 } server_prefill_progress;
@@ -9857,6 +10095,11 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
+    if (p->req && p->req->stream && p->fd >= 0 &&
+        (!p->last_keepalive_t || now - p->last_keepalive_t >= 2.0))
+    {
+        if (sse_comment(p->fd, phase)) p->last_keepalive_t = now;
+    }
     if (p->srv && current > p->cached_tokens) {
         kv_cache_maybe_store_continued(p->srv);
     }
@@ -10041,6 +10284,8 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                    path ? path : "");
         server_prefill_progress rebuild_progress = {
             .srv = s,
+            .fd = j->fd,
+            .req = &j->req,
             .kind = j->req.kind,
             .prompt_tokens = sync_prompt->len,
             .cached_tokens = loaded,
@@ -10254,6 +10499,8 @@ static void generate_job(server *s, job *j) {
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
         .srv = s,
+        .fd = j->fd,
+        .req = &j->req,
         .kind = j->req.kind,
         .prompt_tokens = prompt_tokens,
         .cached_tokens = cached,
@@ -10330,7 +10577,7 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
             trace_event(s, trace_id, "prefill failed: %s", err);
-            http_error(j->fd, 500, err);
+            http_error(j->fd, http_status_for_prefill_error(err), err);
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
@@ -10343,7 +10590,7 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         trace_event(s, trace_id, "prefill failed: %s", err);
-        http_error(j->fd, 500, err);
+        http_error(j->fd, http_status_for_prefill_error(err), err);
         return;
     }
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
@@ -10378,7 +10625,7 @@ static void generate_job(server *s, job *j) {
     const bool responses_live_chat = request_uses_responses_live_stream(&j->req);
     long responses_created_at = (long)time(NULL);
     if (j->req.stream) {
-        if (!sse_headers(j->fd)) {
+        if (!j->stream_headers_sent && !sse_headers(j->fd)) {
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s%s%s sse headers failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -11163,16 +11410,48 @@ static void *client_main(void *arg) {
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
 
-    pthread_mutex_lock(&j.mu);
-    if (!enqueue(s, &j)) {
-        pthread_mutex_unlock(&j.mu);
-        http_error(fd, 503, "server shutting down");
+    bool queue_stream_ok = true;
+    if (req.stream) {
+        if (!sse_headers(fd) || !sse_comment(fd, "queued")) {
+            queue_stream_ok = false;
+        } else {
+            j.stream_headers_sent = true;
+        }
+    }
+    if (!queue_stream_ok) {
         pthread_cond_destroy(&j.cv);
         pthread_mutex_destroy(&j.mu);
         request_free(&j.req);
         goto done;
     }
-    while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
+
+    pthread_mutex_lock(&j.mu);
+    if (!enqueue(s, &j)) {
+        pthread_mutex_unlock(&j.mu);
+        if (!j.stream_headers_sent) {
+            http_error(fd, 503, "server shutting down");
+        }
+        pthread_cond_destroy(&j.cv);
+        pthread_mutex_destroy(&j.mu);
+        request_free(&j.req);
+        goto done;
+    }
+    bool keepalive_ok = true;
+    while (!j.done) {
+        if (!j.req.stream || !keepalive_ok) {
+            pthread_cond_wait(&j.cv, &j.mu);
+            continue;
+        }
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 2;
+        int rc = pthread_cond_timedwait(&j.cv, &j.mu, &ts);
+        if (!j.done && rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&j.mu);
+            keepalive_ok = sse_comment(fd, "waiting for worker");
+            pthread_mutex_lock(&j.mu);
+        }
+    }
     pthread_mutex_unlock(&j.mu);
 
     pthread_cond_destroy(&j.cv);
@@ -11891,6 +12170,34 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
     chat_msgs_free(&msgs);
     free(schemas);
     tool_schema_orders_free(&orders);
+}
+
+static void test_responses_input_context_compaction_summary_becomes_system(void) {
+    const char *json =
+        "["
+        "{\"type\":\"context_compaction\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Earlier work: repo structure located; pending task is fix retry loop.\"}]},"
+        "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Continue the fix.\"}]}"
+        "]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(msgs.len == 2);
+    TEST_ASSERT(!strcmp(msgs.v[0].role, "system"));
+    TEST_ASSERT(strstr(msgs.v[0].content,
+                       "Conversation summary from context compaction:") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content,
+                       "Earlier work: repo structure located") != NULL);
+    TEST_ASSERT(!strcmp(msgs.v[1].role, "user"));
+    TEST_ASSERT(!strcmp(msgs.v[1].content, "Continue the fix."));
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "Earlier work: repo structure located") != NULL);
+    free(prompt);
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
 }
 
 static void test_responses_output_sends_tool_search_call_item(void) {
@@ -13702,6 +14009,55 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_responses_build_trimmed_msgs_keeps_system_and_recent_suffix(void) {
+    chat_msgs src = {0};
+    chat_msg msg = {0};
+
+    msg.role = xstrdup("system");
+    msg.content = xstrdup("Global instructions.");
+    chat_msgs_push(&src, msg);
+
+    msg = (chat_msg){0};
+    msg.role = xstrdup("user");
+    msg.content = xstrdup("Old task.");
+    chat_msgs_push(&src, msg);
+
+    msg = (chat_msg){0};
+    msg.role = xstrdup("assistant");
+    msg.content = xstrdup("Old answer.");
+    chat_msgs_push(&src, msg);
+
+    msg = (chat_msg){0};
+    msg.role = xstrdup("user");
+    msg.content = xstrdup("Recent task.");
+    chat_msgs_push(&src, msg);
+
+    msg = (chat_msg){0};
+    msg.role = xstrdup("assistant");
+    msg.content = xstrdup("Recent answer.");
+    chat_msgs_push(&src, msg);
+
+    chat_msgs trimmed = {0};
+    responses_build_trimmed_msgs(&src, 3, &trimmed);
+    TEST_ASSERT(trimmed.len == 4);
+    TEST_ASSERT(!strcmp(trimmed.v[0].role, "system"));
+    TEST_ASSERT(!strcmp(trimmed.v[0].content, "Global instructions."));
+    TEST_ASSERT(!strcmp(trimmed.v[1].role, "system"));
+    TEST_ASSERT(strstr(trimmed.v[1].content, "Earlier conversation turns were omitted") != NULL);
+    TEST_ASSERT(!strcmp(trimmed.v[2].role, "user"));
+    TEST_ASSERT(!strcmp(trimmed.v[2].content, "Recent task."));
+    TEST_ASSERT(!strcmp(trimmed.v[3].role, "assistant"));
+    TEST_ASSERT(!strcmp(trimmed.v[3].content, "Recent answer."));
+
+    chat_msgs_free(&trimmed);
+    chat_msgs_free(&src);
+}
+
+static void test_prefill_context_overflow_maps_to_bad_request(void) {
+    TEST_ASSERT(http_status_for_prefill_error("prompt exceeds context") == 400);
+    TEST_ASSERT(http_status_for_prefill_error("metal prefill failed") == 500);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -14422,6 +14778,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_input_tool_search_output_loads_tools();
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
+    test_responses_input_context_compaction_summary_becomes_system();
     test_responses_output_sends_tool_search_call_item();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
@@ -14468,6 +14825,8 @@ static void ds4_server_unit_tests_run(void) {
     test_stop_list_streaming_holds_and_trims_stop_text();
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
+    test_responses_build_trimmed_msgs_keeps_system_and_recent_suffix();
+    test_prefill_context_overflow_maps_to_bad_request();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
