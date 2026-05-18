@@ -1,4 +1,4 @@
-static void request_init(request *r, req_kind kind, int max_tokens) {
+DS4_SERVER_PARSE_LINKAGE void request_init(request *r, req_kind kind, int max_tokens) {
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
@@ -11,7 +11,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->think_mode = DS4_THINK_HIGH;
 }
 
-static void request_free(request *r) {
+DS4_SERVER_PARSE_LINKAGE void request_free(request *r) {
     ds4_tokens_free(&r->prompt);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
@@ -56,7 +56,7 @@ static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     return false;
 }
 
-static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
+DS4_SERVER_PARSE_LINKAGE bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     json_ws(p);
     if (json_lit(p, "null")) return true;
     char *effort = NULL;
@@ -167,7 +167,7 @@ static void stop_list_push(stop_list *stops, char *s) {
     stops->v[stops->len++] = s;
 }
 
-static bool parse_stop(const char **p, stop_list *out) {
+DS4_SERVER_PARSE_LINKAGE bool parse_stop(const char **p, stop_list *out) {
     json_ws(p);
     stop_list_clear(out);
     if (**p == '"') {
@@ -1513,9 +1513,10 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
-static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
-                                     ds4_think_mode think_mode) {
+DS4_SERVER_PARSE_LINKAGE char *render_chat_prompt_text(const chat_msgs *msgs,
+                                                       const char *tool_schemas,
+                                                       const tool_schema_orders *tool_orders,
+                                                       ds4_think_mode think_mode) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
@@ -1862,8 +1863,10 @@ static void anthropic_prepare_live_continuation(request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
-static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen) {
+DS4_SERVER_PARSE_LINKAGE bool parse_chat_request(ds4_engine *e, server *s,
+                                                 const char *body, int def_tokens,
+                                                 int ctx_size, request *r,
+                                                 char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     const char *p = body;
     bool got_messages = false;
@@ -2034,8 +2037,10 @@ bad:
     return false;
 }
 
-static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen) {
+DS4_SERVER_PARSE_LINKAGE bool parse_anthropic_request(ds4_engine *e, server *s,
+                                                      const char *body, int def_tokens,
+                                                      int ctx_size, request *r,
+                                                      char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_ANTHROPIC;
     const char *p = body;
@@ -2442,11 +2447,12 @@ static bool responses_trim_candidate_content(chat_msgs *msgs) {
     return false;
 }
 
-static bool responses_trim_history_to_context(ds4_engine *e, chat_msgs *msgs,
-                                              const char *tool_schemas,
-                                              const tool_schema_orders *orders,
-                                              ds4_think_mode think_mode,
-                                              int ctx_size) {
+DS4_SERVER_PARSE_LINKAGE bool responses_trim_history_to_context(ds4_engine *e,
+                                                                chat_msgs *msgs,
+                                                                const char *tool_schemas,
+                                                                const tool_schema_orders *orders,
+                                                                ds4_think_mode think_mode,
+                                                                int ctx_size) {
     if (!e || !msgs || msgs->len <= 0 || ctx_size <= 1) return false;
     int first_non_system = -1;
     for (int i = 0; i < msgs->len; i++) {
@@ -3090,8 +3096,10 @@ static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
     return true;
 }
 
-static bool parse_responses_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                                    int ctx_size, request *r, char *err, size_t errlen) {
+DS4_SERVER_PARSE_LINKAGE bool parse_responses_request(ds4_engine *e, server *s,
+                                                      const char *body, int def_tokens,
+                                                      int ctx_size, request *r,
+                                                      char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->api = API_RESPONSES;
     const char *p = body;
@@ -3394,8 +3402,10 @@ static bool parse_prompt(const char **p, char **out) {
     return true;
 }
 
-static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
-                                     int ctx_size, request *r, char *err, size_t errlen) {
+DS4_SERVER_PARSE_LINKAGE bool parse_completion_request(ds4_engine *e,
+                                                       const char *body, int def_tokens,
+                                                       int ctx_size, request *r,
+                                                       char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
     const char *p = body;
     char *prompt = NULL;
@@ -3534,4 +3544,3 @@ bad:
     request_free(r);
     return false;
 }
-

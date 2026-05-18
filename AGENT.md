@@ -45,6 +45,15 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   declarations for requests, chat/tool payloads, KV metadata, tool memory, and
   `server`/`job`; extracted first in the second-stage modularization to shrink
   `ds4_server.c` without changing linkage.
+- `ds4_server_data.inc`: container ownership, clone/free helpers, and tool
+  schema order utilities for chat/tool payloads; extracted so `ds4_server.c`
+  keeps only top-level wiring before the larger protocol blocks.
+- `ds4_server_data_api.h`: shared linkage macro and stable declarations for
+  chat/tool container ownership helpers and schema-order utilities; added so the
+  data layer can later move out of include form without reworking every caller.
+- `ds4_server_parse_api.h`: shared linkage macro and stable declarations for
+  the parse-layer entry points currently used by HTTP handling and tests; added
+  as a preparation step before turning parse include blocks into real modules.
 - `ds4_server_parse.inc`: request parsing, tool schema normalization,
   chat/responses prompt rendering, stop handling, and Responses history trim;
   extracted as one contiguous block to remove the bulk of protocol parsing from
