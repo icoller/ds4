@@ -118,7 +118,7 @@ ds4.o: ds4.c ds4.h ds4_gpu.h
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_server.o: ds4_server.c ds4.h rax.h
+ds4_server.o: ds4_server.c ds4_server_types.h ds4_server_parse.inc ds4_server_stream.inc ds4.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
 ds4_bench.o: ds4_bench.c ds4.h
@@ -127,7 +127,7 @@ ds4_bench.o: ds4_bench.c ds4.h
 ds4_eval.o: ds4_eval.c ds4.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h rax.h
+ds4_test.o: tests/ds4_test.c ds4_server.c ds4_server_types.h ds4_server_parse.inc ds4_server_stream.inc ds4.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
