@@ -2,7 +2,7 @@
 #define DS4_SERVER_DATA_API_H
 
 #ifndef DS4_SERVER_DATA_LINKAGE
-#define DS4_SERVER_DATA_LINKAGE static
+#define DS4_SERVER_DATA_LINKAGE
 #endif
 
 DS4_SERVER_DATA_LINKAGE void tool_call_free(tool_call *tc);

@@ -59,8 +59,6 @@ static void stop_signal_handler(int sig) {
 
 #include "ds4_server_data_api.h"
 
-#include "ds4_server_data.inc"
-
 #include "ds4_server_parse_api.h"
 
 #include "ds4_server_parse.inc"
@@ -131,6 +129,7 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.cv, NULL);
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
+    pthread_mutex_init(&s.continuation_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");

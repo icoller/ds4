@@ -75,6 +75,10 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
+    continuation_clear_all(s);
+    if (s->continuations_by_id) raxFree(s->continuations_by_id);
+    if (s->continuation_alias_by_key) raxFree(s->continuation_alias_by_key);
+    pthread_mutex_destroy(&s->continuation_mu);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
@@ -300,4 +304,3 @@ static server_config parse_options(int argc, char **argv) {
     }
     return c;
 }
-

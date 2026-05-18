@@ -24,6 +24,11 @@ DS4_SERVER_PARSE_LINKAGE void request_free(request *r) {
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    free(r->previous_response_id);
+    free(r->continuation_suffix_text);
+    free(r->client_session_key);
+    free(r->implicit_session_basis);
+    free(r->implicit_session_key);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -1660,6 +1665,26 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
+static char *responses_build_session_basis(const char *instructions,
+                                           const chat_msgs *msgs,
+                                           const char *tool_schemas) {
+    buf out = {0};
+    buf_puts(&out, "instructions:");
+    buf_puts(&out, instructions ? instructions : "");
+    buf_puts(&out, "\n--system--\n");
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!role_is_system(m->role)) continue;
+        buf_puts(&out, m->role ? m->role : "");
+        buf_putc(&out, ':');
+        buf_puts(&out, m->content ? m->content : "");
+        buf_putc(&out, '\n');
+    }
+    buf_puts(&out, "--tools--\n");
+    buf_puts(&out, tool_schemas ? tool_schemas : "");
+    return buf_take(&out);
+}
+
 static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
     if (!m || !id || !id[0] || strcmp(m->role, "assistant")) return false;
     for (int i = 0; i < m->calls.len; i++) {
@@ -3250,31 +3275,25 @@ DS4_SERVER_PARSE_LINKAGE bool parse_responses_request(ds4_engine *e, server *s,
                  * thinking. Other effort values choose between HIGH and MAX. */
                 if (reasoning_effort == DS4_THINK_NONE) thinking_enabled = false;
             }
-        } else if (!strcmp(key, "previous_response_id") ||
-                   !strcmp(key, "conversation"))
-        {
-            /* Official Responses state can be durable:
-             *   previous_response_id chains to a stored prior response, and
-             *   conversation points at a persistent Conversations object.
-             *
-             * DS4 does not yet implement that durable store.  The supported
-             * modes are either (a) a live in-memory continuation checked by
-             * visible transcript / tool call ids, or (b) stateless replay of
-             * the full input items.  Accepting a non-null durable reference
-             * without loading the referenced items would silently truncate the
-             * prompt, so reject it explicitly. */
+        } else if (!strcmp(key, "previous_response_id")) {
+            free(r->previous_response_id);
+            r->previous_response_id = NULL;
             json_ws(&p);
-            if (!json_lit(&p, "null")) {
-                snprintf(err, errlen,
-                         "%s is not supported; replay full input instead",
-                         key);
+            if (!json_lit(&p, "null") &&
+                !json_string(&p, &r->previous_response_id))
+            {
                 free(key);
-                chat_msgs_free(&msgs);
-                buf_free(&loaded_tool_schemas);
-                free(instructions);
-                free(tool_schemas);
-                request_free(r);
-                return false;
+                goto bad;
+            }
+        } else if (!strcmp(key, "conversation")) {
+            free(r->client_session_key);
+            r->client_session_key = NULL;
+            json_ws(&p);
+            if (!json_lit(&p, "null") &&
+                !json_string(&p, &r->client_session_key))
+            {
+                free(key);
+                goto bad;
             }
         } else if (!json_skip_value(&p)) {
             free(key);
@@ -3352,6 +3371,37 @@ DS4_SERVER_PARSE_LINKAGE bool parse_responses_request(ds4_engine *e, server *s,
         r->responses_live_suffix_text = NULL;
         r->responses_requires_live_tool_state = false;
         r->responses_requires_live_reasoning = false;
+    }
+    free(r->implicit_session_basis);
+    r->implicit_session_basis =
+        responses_build_session_basis(instructions, &msgs, active_tool_schemas);
+    if (r->previous_response_id && r->previous_response_id[0]) {
+        if ((instructions && instructions[0]) || (tool_schemas && tool_schemas[0])) {
+            snprintf(err, errlen,
+                     "previous_response_id currently supports appending new input only; do not resend instructions or tools");
+            chat_msgs_free(&msgs);
+            buf_free(&combined_tool_schemas);
+            buf_free(&loaded_tool_schemas);
+            free(instructions);
+            free(tool_schemas);
+            request_free(r);
+            return false;
+        }
+        for (int i = 0; i < msgs.len; i++) {
+            if (role_is_system(msgs.v[i].role)) {
+                snprintf(err, errlen,
+                         "previous_response_id currently does not support new system/developer messages");
+                chat_msgs_free(&msgs);
+                buf_free(&combined_tool_schemas);
+                buf_free(&loaded_tool_schemas);
+                free(instructions);
+                free(tool_schemas);
+                request_free(r);
+                return false;
+            }
+        }
+        free(r->continuation_suffix_text);
+        r->continuation_suffix_text = render_live_tool_tail(&msgs, 0, r->think_mode);
     }
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);

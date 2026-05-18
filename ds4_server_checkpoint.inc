@@ -239,6 +239,242 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
     return true;
 }
 
+#define DS4_CONTINUATION_MAX_ENTRIES 128
+
+static void continuation_link_tail(server *s, continuation_entry *e) {
+    e->prev = s->continuation_tail;
+    e->next = NULL;
+    if (s->continuation_tail) s->continuation_tail->next = e;
+    else s->continuation_head = e;
+    s->continuation_tail = e;
+}
+
+static void continuation_unlink(server *s, continuation_entry *e) {
+    if (e->prev) e->prev->next = e->next;
+    else s->continuation_head = e->next;
+    if (e->next) e->next->prev = e->prev;
+    else s->continuation_tail = e->prev;
+    e->prev = e->next = NULL;
+}
+
+static void continuation_touch(server *s, continuation_entry *e) {
+    if (!s || !e || s->continuation_tail == e) return;
+    continuation_unlink(s, e);
+    continuation_link_tail(s, e);
+}
+
+static void continuation_entry_free(continuation_entry *e) {
+    if (!e) return;
+    free(e->response_id);
+    free(e->visible_text);
+    free(e->model);
+    free(e->implicit_session_key);
+    ds4_session_snapshot_free(&e->snapshot);
+    free(e);
+}
+
+static continuation_entry *continuation_find_by_id(server *s, const char *id) {
+    if (!s || !s->continuations_by_id || !id || !id[0]) return NULL;
+    void *v = raxFind(s->continuations_by_id, (unsigned char *)id, strlen(id));
+    return v == raxNotFound ? NULL : v;
+}
+
+static continuation_entry *continuation_find_by_implicit_key(server *s, const char *key) {
+    if (!s || !s->continuation_alias_by_key || !key || !key[0]) return NULL;
+    void *v = raxFind(s->continuation_alias_by_key, (unsigned char *)key, strlen(key));
+    return v == raxNotFound ? NULL : v;
+}
+
+static void continuation_remove(server *s, continuation_entry *e) {
+    if (!s || !e) return;
+    if (s->continuations_by_id && e->response_id) {
+        void *old = NULL;
+        (void)raxRemove(s->continuations_by_id, (unsigned char *)e->response_id,
+                        strlen(e->response_id), &old);
+    }
+    if (s->continuation_alias_by_key && e->implicit_session_key) {
+        void *cur = raxFind(s->continuation_alias_by_key,
+                            (unsigned char *)e->implicit_session_key,
+                            strlen(e->implicit_session_key));
+        if (cur != raxNotFound && cur == e) {
+            void *old = NULL;
+            (void)raxRemove(s->continuation_alias_by_key,
+                            (unsigned char *)e->implicit_session_key,
+                            strlen(e->implicit_session_key), &old);
+        }
+    }
+    continuation_unlink(s, e);
+    if (s->continuation_entries > 0) s->continuation_entries--;
+    continuation_entry_free(e);
+}
+
+static void continuation_clear_all(server *s) {
+    while (s && s->continuation_head) continuation_remove(s, s->continuation_head);
+}
+
+static void request_finalize_implicit_session_key(request *r) {
+    if (!r || r->api != API_RESPONSES) return;
+    free(r->implicit_session_key);
+    r->implicit_session_key = NULL;
+    const bool has_session = r->client_session_key && r->client_session_key[0];
+    const bool has_basis = r->implicit_session_basis && r->implicit_session_basis[0];
+    if (!has_session && !has_basis) return;
+
+    buf raw = {0};
+    buf_puts(&raw, "api:responses\nmodel:");
+    buf_puts(&raw, r->model ? r->model : "");
+    buf_puts(&raw, "\nsession:");
+    buf_puts(&raw, r->client_session_key ? r->client_session_key : "");
+    buf_puts(&raw, "\nbasis:");
+    buf_puts(&raw, r->implicit_session_basis ? r->implicit_session_basis : "");
+    if (raw.len == 0) {
+        buf_free(&raw);
+        return;
+    }
+    char sha[41];
+    sha1_bytes_hex(raw.ptr ? raw.ptr : "", raw.len, sha);
+    buf_free(&raw);
+
+    buf key = {0};
+    buf_puts(&key, "resp-implicit:");
+    buf_puts(&key, sha);
+    r->implicit_session_key = buf_take(&key);
+}
+
+static char *responses_build_visible_transcript(const request *r,
+                                                const char *content,
+                                                const char *reasoning,
+                                                const tool_calls *calls) {
+    if (!r || !r->prompt_text) return NULL;
+    char *suffix = build_responses_visible_assistant_suffix(r, content, reasoning, calls);
+    buf out = {0};
+    buf_puts(&out, r->prompt_text);
+    buf_puts(&out, suffix ? suffix : "");
+    free(suffix);
+    return buf_take(&out);
+}
+
+static int continuation_restore_prompt(server *s, const continuation_entry *entry,
+                                       const char *suffix_text,
+                                       ds4_tokens *effective_prompt,
+                                       char *err, size_t errlen) {
+    if (!s || !entry || !suffix_text || !effective_prompt) return 0;
+    int loaded = 0;
+    char *loaded_path = NULL;
+    if (entry->visible_text && s->kv.enabled) {
+        loaded = kv_cache_try_load_text(s, entry->visible_text, NULL,
+                                        &loaded_path, NULL, true);
+        free(loaded_path);
+    }
+    if (loaded == 0 && entry->snapshot.ptr && entry->snapshot.len > 0) {
+        if (ds4_session_load_snapshot(s->session, &entry->snapshot, err, errlen) != 0) {
+            return 0;
+        }
+        const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+        loaded = live_tokens ? live_tokens->len : 0;
+    }
+    if (loaded <= 0) {
+        snprintf(err, errlen, "stored continuation state is not available");
+        return 0;
+    }
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != loaded) {
+        snprintf(err, errlen, "stored continuation state is inconsistent");
+        return 0;
+    }
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, suffix_text, effective_prompt);
+    return loaded;
+}
+
+static void continuation_store_response(server *s, const request *r,
+                                        const char *response_id,
+                                        const char *visible_text) {
+    if (!s || !r || r->api != API_RESPONSES || !response_id || !response_id[0]) return;
+
+    if (!s->continuations_by_id) s->continuations_by_id = raxNew();
+    if (!s->continuation_alias_by_key) s->continuation_alias_by_key = raxNew();
+    if (!s->continuations_by_id || !s->continuation_alias_by_key) die("out of memory");
+
+    continuation_entry *e = continuation_find_by_id(s, response_id);
+    if (!e) {
+        e = xmalloc(sizeof(*e));
+        memset(e, 0, sizeof(*e));
+        e->response_id = xstrdup(response_id);
+        continuation_link_tail(s, e);
+        s->continuation_entries++;
+        if (!raxInsert(s->continuations_by_id, (unsigned char *)e->response_id,
+                       strlen(e->response_id), e, NULL))
+        {
+            die("out of memory");
+        }
+    } else {
+        if (s->continuation_alias_by_key && e->implicit_session_key) {
+            void *cur = raxFind(s->continuation_alias_by_key,
+                                (unsigned char *)e->implicit_session_key,
+                                strlen(e->implicit_session_key));
+            if (cur != raxNotFound && cur == e) {
+                void *old = NULL;
+                (void)raxRemove(s->continuation_alias_by_key,
+                                (unsigned char *)e->implicit_session_key,
+                                strlen(e->implicit_session_key), &old);
+            }
+        }
+        free(e->visible_text);
+        e->visible_text = NULL;
+        free(e->model);
+        e->model = NULL;
+        free(e->implicit_session_key);
+        e->implicit_session_key = NULL;
+        ds4_session_snapshot_free(&e->snapshot);
+        continuation_touch(s, e);
+    }
+
+    e->created_at = e->created_at ? e->created_at : (uint64_t)time(NULL);
+    e->last_used = (uint64_t)time(NULL);
+    e->model = r->model ? xstrdup(r->model) : NULL;
+    e->visible_text = visible_text ? xstrdup(visible_text) : NULL;
+    if (r->implicit_session_key && r->implicit_session_key[0]) {
+        e->implicit_session_key = xstrdup(r->implicit_session_key);
+        void *old = NULL;
+        (void)raxRemove(s->continuation_alias_by_key,
+                        (unsigned char *)e->implicit_session_key,
+                        strlen(e->implicit_session_key), &old);
+        if (!raxInsert(s->continuation_alias_by_key,
+                       (unsigned char *)e->implicit_session_key,
+                       strlen(e->implicit_session_key), e, NULL))
+        {
+            die("out of memory");
+        }
+    }
+
+    bool disk_backed = false;
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (e->visible_text && live_tokens && s->kv.enabled &&
+        live_tokens->len >= s->kv.opt.min_tokens)
+    {
+        disk_backed = kv_cache_store_live_prefix_text(
+            s, live_tokens, live_tokens->len, "continued",
+            e->visible_text, KV_EXT_RESPONSES_VISIBLE, "responses-visible");
+    }
+    if (!disk_backed) {
+        char snap_err[160] = {0};
+        if (ds4_session_save_snapshot(s->session, &e->snapshot,
+                                      snap_err, sizeof(snap_err)) != 0) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: failed to save continuation snapshot for %s: %s",
+                       response_id, snap_err);
+        }
+    }
+
+    while (s->continuation_entries > DS4_CONTINUATION_MAX_ENTRIES &&
+           s->continuation_head)
+    {
+        continuation_remove(s, s->continuation_head);
+    }
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact

@@ -760,7 +760,7 @@ static void test_responses_usage_reports_cache_details(void) {
     }
 
     responses_stream st;
-    responses_stream_init(&r, &st);
+    responses_stream_init(&r, &st, "resp_test");
     TEST_ASSERT(responses_sse_completed(sv[0], &r, &st, NULL, NULL,
                                         "stop", 10, 2, 1234));
     shutdown(sv[0], SHUT_WR);
@@ -2183,6 +2183,52 @@ static void test_responses_visible_suffix_matches_client_replay(void) {
     request_free(&r);
 }
 
+static void test_responses_implicit_session_key_uses_session_and_basis(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    free(r.client_session_key);
+    r.client_session_key = xstrdup("sess-1");
+    r.implicit_session_basis = xstrdup("system:a\ntools:b");
+
+    request_finalize_implicit_session_key(&r);
+    TEST_ASSERT(r.implicit_session_key != NULL);
+    TEST_ASSERT(!strncmp(r.implicit_session_key, "resp-implicit:", 14));
+
+    char *first = xstrdup(r.implicit_session_key);
+    free(r.client_session_key);
+    r.client_session_key = xstrdup("sess-2");
+    request_finalize_implicit_session_key(&r);
+    TEST_ASSERT(strcmp(first, r.implicit_session_key) != 0);
+
+    free(first);
+    request_free(&r);
+}
+
+static void test_previous_response_tail_renders_new_user_append(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.think_mode = DS4_THINK_HIGH;
+    r.previous_response_id = xstrdup("resp_prev");
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("继续处理剩余任务");
+    chat_msgs_push(&msgs, user);
+
+    r.continuation_suffix_text = render_live_tool_tail(&msgs, 0, r.think_mode);
+    TEST_ASSERT(r.continuation_suffix_text != NULL);
+    TEST_ASSERT(!strncmp(r.continuation_suffix_text, "<｜end▁of▁sentence｜><｜User｜>",
+                         strlen("<｜end▁of▁sentence｜><｜User｜>")));
+    TEST_ASSERT(strstr(r.continuation_suffix_text, "继续处理剩余任务") != NULL);
+    TEST_ASSERT(strstr(r.continuation_suffix_text, "<｜Assistant｜><think>") != NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
 static void test_exact_dsml_tool_replay_can_be_disabled(void) {
     const char *dsml =
         "\n\n<｜DSML｜tool_calls>\n"
@@ -3482,6 +3528,8 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_tool_output_id_validation();
     test_responses_stateless_tool_replay_requires_reasoning();
     test_responses_visible_suffix_matches_client_replay();
+    test_responses_implicit_session_key_uses_session_and_basis();
+    test_previous_response_tail_renders_new_user_append();
     test_exact_dsml_tool_replay_can_be_disabled();
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
@@ -3532,4 +3580,3 @@ int main(void) {
     return 0;
 }
 #endif
-

@@ -10,21 +10,53 @@ static void generate_job(server *s, job *j) {
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
+    bool responses_stored_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
+    int cached = 0;
+    const char *cache_source = "none";
+    continuation_entry *stored_continuation = NULL;
+    const char *stored_continuation_match = NULL;
+    if (responses_protocol && j->req.continuation_suffix_text) {
+        if (j->req.previous_response_id && j->req.previous_response_id[0]) {
+            stored_continuation = continuation_find_by_id(s, j->req.previous_response_id);
+            stored_continuation_match = "previous_response_id";
+        }
+        if (!stored_continuation &&
+            j->req.implicit_session_key && j->req.implicit_session_key[0]) {
+            stored_continuation = continuation_find_by_implicit_key(
+                s, j->req.implicit_session_key);
+            stored_continuation_match = "implicit_session";
+        }
+        if (stored_continuation) {
+            cached = continuation_restore_prompt(s, stored_continuation,
+                                                 j->req.continuation_suffix_text,
+                                                 &effective_prompt,
+                                                 err, sizeof(err));
+            if (cached > 0) {
+                responses_stored_continuation = true;
+                prompt_for_sync = &effective_prompt;
+                cache_source = "responses-snapshot";
+            }
+        }
+    }
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = responses_live_visible_prefix_prompt(s, &j->req, old_pos,
+    if (!responses_stored_continuation) {
+        cached = responses_live_visible_prefix_prompt(s, &j->req, old_pos,
                                                       &effective_prompt);
-    const char *cache_source = cached > 0 ? "responses-visible" : "none";
-    if (cached > 0) {
+    }
+    cache_source = cached > 0 ? "responses-visible" : "none";
+    if (responses_stored_continuation) {
+        cache_source = "responses-snapshot";
+    } else if (cached > 0) {
         responses_live_match = "visible-prefix";
         if (responses_live_matches_request(s, &j->req.responses_live_call_ids,
                                            old_pos))
@@ -32,14 +64,14 @@ static void generate_job(server *s, job *j) {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
     }
-    if (cached == 0) {
+    if (!responses_stored_continuation && cached == 0) {
         cached = responses_live_continuation_prompt(s, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
         cache_source = cached > 0 ? "responses-tool-output" : "none";
         if (cached > 0) responses_live_match = "tool-output-ids";
     }
-    if (cached > 0) {
+    if (responses_stored_continuation || cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
     } else {
@@ -52,7 +84,8 @@ static void generate_job(server *s, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    if (cached == 0 && responses_protocol &&
+    if (!responses_stored_continuation &&
+        cached == 0 && responses_protocol &&
         j->req.responses_requires_live_tool_state)
     {
         /* The parser saw a valid live call_id, but by worker execution time the
@@ -62,6 +95,14 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "Responses continuation state is not available; retry by replaying the full input history");
+        return;
+    } else if (!responses_stored_continuation &&
+               cached == 0 && responses_protocol &&
+               j->req.previous_response_id && j->req.previous_response_id[0])
+    {
+        ds4_tokens_free(&effective_prompt);
+        http_error(j->fd, s->enable_cors, 409,
+                   "previous_response_id state is not available; replay full input or retry with the latest response");
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
@@ -158,7 +199,13 @@ static void generate_job(server *s, job *j) {
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
-    if (responses_live_continuation) {
+    if (responses_stored_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: responses stored continuation RESPPROTO match=%s cached=%d prompt=%d",
+                   stored_continuation_match ? stored_continuation_match : "snapshot",
+                   cached,
+                   prompt_tokens);
+    } else if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
                    responses_live_match ? responses_live_match : "unknown",
@@ -290,6 +337,10 @@ static void generate_job(server *s, job *j) {
     snprintf(id, sizeof(id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
+    char responses_response_id[40] = {0};
+    if (responses_protocol) {
+        responses_random_id(responses_response_id, sizeof(responses_response_id), "resp_");
+    }
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -324,7 +375,7 @@ static void generate_job(server *s, job *j) {
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
         if (responses_live_chat) {
-            responses_stream_init(&j->req, &responses_live);
+            responses_stream_init(&j->req, &responses_live, responses_response_id);
             responses_live.active = true;
             if (!responses_sse_created(j->fd, &j->req, &responses_live, responses_created_at)) {
                 server_log(DS4_LOG_GENERATION,
@@ -663,24 +714,21 @@ static void generate_job(server *s, job *j) {
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
+    char *responses_visible = NULL;
     if (j->req.api == API_RESPONSES) {
-        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        if (strcmp(final_finish, "error")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
              * reasoning and exact sampled tool-call bytes. */
-            char *visible_suffix =
-                build_responses_visible_assistant_suffix(&j->req,
+            responses_visible =
+                responses_build_visible_transcript(&j->req,
                     parsed_content ? parsed_content : "",
-                    parsed_reasoning,
-                    &parsed_calls);
-            buf visible = {0};
-            buf_puts(&visible, j->req.prompt_text ? j->req.prompt_text : "");
-            buf_puts(&visible, visible_suffix ? visible_suffix : "");
-            responses_live_remember(s, visible.ptr ? visible.ptr : "",
+                    parsed_reasoning, &parsed_calls);
+            responses_live_remember(s, responses_visible ? responses_visible : "",
                                     parsed_calls.len ? &parsed_calls : NULL);
-            buf_free(&visible);
-            free(visible_suffix);
+            continuation_store_response(s, &j->req, responses_response_id,
+                                        responses_visible ? responses_visible : "");
         } else {
             responses_live_clear(s);
         }
@@ -768,7 +816,7 @@ static void generate_job(server *s, job *j) {
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
     } else if (j->req.api == API_RESPONSES) {
-        responses_final_response(j->fd, s->enable_cors, &j->req, id,
+        responses_final_response(j->fd, s->enable_cors, &j->req, responses_response_id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
@@ -845,7 +893,7 @@ static void generate_job(server *s, job *j) {
     anthropic_stream_free(&anthropic_live);
     openai_stream_free(&openai_live);
     responses_stream_free(&responses_live);
+    free(responses_visible);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
 }
-

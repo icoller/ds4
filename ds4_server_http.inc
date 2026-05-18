@@ -44,11 +44,13 @@ typedef struct {
     char method[8];
     char path[256];
     char *body;
+    char *session_key;
     size_t body_len;
 } http_request;
 
 static void http_request_free(http_request *r) {
     free(r->body);
+    free(r->session_key);
     memset(r, 0, sizeof(*r));
 }
 
@@ -77,6 +79,28 @@ static long content_length(const char *h, size_t n) {
         if (p < end) p++;
     }
     return 0;
+}
+
+static char *header_value_dup(const char *h, size_t n, const char *name) {
+    const char *p = h, *end = h + n;
+    const size_t name_len = strlen(name);
+    while (p < end) {
+        const char *line = p;
+        while (p < end && *p != '\n') p++;
+        size_t len = (size_t)(p - line);
+        if (len && line[len - 1] == '\r') len--;
+        if (len > name_len && !strncasecmp(line, name, name_len) &&
+            line[name_len] == ':')
+        {
+            const char *v = line + name_len + 1;
+            const char *line_end = line + len;
+            while (v < line_end && isspace((unsigned char)*v)) v++;
+            while (line_end > v && isspace((unsigned char)line_end[-1])) line_end--;
+            return xstrndup(v, (size_t)(line_end - v));
+        }
+        if (p < end) p++;
+    }
+    return NULL;
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -108,6 +132,16 @@ static bool read_http_request(int fd, http_request *r) {
 
     long clen = content_length(b.ptr, (size_t)hend);
     if (clen < 0 || (size_t)clen > max_body) goto fail;
+    r->session_key = header_value_dup(b.ptr, (size_t)hend, "X-Session-Key");
+    if (!r->session_key) {
+        r->session_key = header_value_dup(b.ptr, (size_t)hend, "X-Conversation-Key");
+    }
+    if (!r->session_key) {
+        r->session_key = header_value_dup(b.ptr, (size_t)hend, "OpenAI-Conversation-ID");
+    }
+    if (!r->session_key) {
+        r->session_key = header_value_dup(b.ptr, (size_t)hend, "Anthropic-Conversation-ID");
+    }
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
@@ -245,6 +279,10 @@ static void *client_main(void *arg) {
         goto done;
     }
     if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok && !req.client_session_key && hr.session_key && hr.session_key[0]) {
+        req.client_session_key = xstrdup(hr.session_key);
+    }
+    if (ok) request_finalize_implicit_session_key(&req);
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -357,4 +395,3 @@ static void set_client_socket_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
-

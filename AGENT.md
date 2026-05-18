@@ -78,14 +78,32 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   stay unchanged.
 - `ds4_server_checkpoint.inc`: checkpoint canonicalization, visible replay
   suffix construction, and continuation/prefill helpers that prepare
-  `generate_job()` without changing the worker execution path.
+  `generate_job()` without changing the worker execution path. This layer now
+  also owns Responses continuation snapshots: explicit `previous_response_id`
+  restore, implicit session alias keys, and visible-transcript based snapshot
+  metadata.
 - `ds4_server_generate.inc`: the full `generate_job()` execution path,
   including cache selection, prefill, decode loop, tool-call parsing, live
   continuation state updates, and final response emission; moved intact as a
   textual include before any semantic refactor.
 - `ds4_server_http.inc`: worker queue, HTTP parsing, model endpoints, client
   connection handling, and socket/listen helpers; extracted as a textual
-  include so the server loop wiring can move without changing behavior.
+  include so the server loop wiring can move without changing behavior. Session
+  continuation hints from headers such as `X-Session-Key` are normalized here
+  before request dispatch.
+
+## Continuations
+
+- `/v1/responses` now supports a minimal server-managed continuation path.
+- Explicit continuation uses `previous_response_id` and restores a stored
+  snapshot or visible-prefix disk checkpoint before appending only the new
+  `input` tail.
+- Implicit continuation is a compatibility fallback for agents that do not send
+  `previous_response_id`: DS4 derives an alias key from session hints plus the
+  stable system/tool basis and maps it to the latest stored response.
+- The current minimal implementation is append-only: when `previous_response_id`
+  is present, do not resend new `instructions`, `tools`, or additional
+  system/developer messages in the same request.
 - `ds4_server_runtime.inc`: server config parsing, usage/help text, backend
   defaults, resource teardown, and other runtime helpers used by the
   production `main`.

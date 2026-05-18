@@ -414,16 +414,7 @@ fail:
     return false;
 }
 
-typedef enum {
-    REQ_CHAT,
-    REQ_COMPLETION,
-} req_kind;
-
-typedef enum {
-    API_OPENAI,
-    API_ANTHROPIC,
-    API_RESPONSES,
-} api_style;
+#include "ds4_server_base_types.h"
 
 static void random_tool_id(char *dst, size_t dstlen, api_style api) {
     static uint64_t fallback_ctr;

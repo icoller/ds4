@@ -1,6 +1,8 @@
 #ifndef DS4_SERVER_TYPES_H
 #define DS4_SERVER_TYPES_H
 
+#include "ds4_server_base_types.h"
+
 typedef struct server server;
 typedef struct job job;
 
@@ -94,6 +96,11 @@ typedef struct {
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+    char *previous_response_id;
+    char *continuation_suffix_text;
+    char *client_session_key;
+    char *implicit_session_basis;
+    char *implicit_session_key;
     tool_replay_stats tool_replay;
 } request;
 
@@ -204,6 +211,20 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+typedef struct continuation_entry continuation_entry;
+
+struct continuation_entry {
+    char *response_id;
+    char *visible_text;
+    char *model;
+    char *implicit_session_key;
+    ds4_session_snapshot snapshot;
+    uint64_t created_at;
+    uint64_t last_used;
+    continuation_entry *prev;
+    continuation_entry *next;
+};
+
 struct server {
     ds4_engine *engine;
     ds4_session *session;
@@ -216,6 +237,7 @@ struct server {
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
+    pthread_mutex_t continuation_mu;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -227,6 +249,11 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    rax *continuations_by_id;
+    rax *continuation_alias_by_key;
+    continuation_entry *continuation_head;
+    continuation_entry *continuation_tail;
+    int continuation_entries;
 };
 
 struct job {

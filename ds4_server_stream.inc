@@ -1836,10 +1836,15 @@ typedef struct {
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
 } responses_stream;
 
-static void responses_stream_init(const request *r, responses_stream *st) {
+static void responses_stream_init(const request *r, responses_stream *st,
+                                  const char *response_id) {
     memset(st, 0, sizeof(*st));
     st->mode = ds4_think_mode_enabled(r->think_mode) ? RESP_STREAM_THINKING : RESP_STREAM_TEXT;
-    responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
+    if (response_id && response_id[0]) {
+        snprintf(st->response_id, sizeof(st->response_id), "%s", response_id);
+    } else {
+        responses_random_id(st->response_id, sizeof(st->response_id), "resp_");
+    }
     responses_random_id(st->reasoning_id, sizeof(st->reasoning_id), "rs_");
     responses_random_id(st->message_id, sizeof(st->message_id), "msg_");
     st->reasoning_index = -1;
@@ -2523,9 +2528,9 @@ static bool responses_final_response(int fd, bool enable_cors,
                                      const char *text, const char *reasoning,
                                      const tool_calls *calls, const char *finish,
                                      int prompt_tokens, int completion_tokens) {
-    (void)id;
     char response_id[40], reasoning_id[40], message_id[40];
-    responses_random_id(response_id, sizeof(response_id), "resp_");
+    if (id && id[0]) snprintf(response_id, sizeof(response_id), "%s", id);
+    else responses_random_id(response_id, sizeof(response_id), "resp_");
     responses_random_id(reasoning_id, sizeof(reasoning_id), "rs_");
     responses_random_id(message_id, sizeof(message_id), "msg_");
 
@@ -3435,4 +3440,3 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
     va_end(ap);
     fputc('\n', stderr);
 }
-
